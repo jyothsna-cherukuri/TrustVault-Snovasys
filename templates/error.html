@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block content %}<section class="panel error-page"><p class="eyebrow">REQUEST STOPPED</p><h1>{{ code }}</h1><p>{{ message }}</p><a class="primary button" href="{{ url_for('documents') if current_user else url_for('login') }}">Return</a></section>{% endblock %}
