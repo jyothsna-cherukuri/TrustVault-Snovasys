@@ -20,8 +20,13 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("TRUSTVAULT_DB", ROOT / "trustvault.db"))
-STORAGE = Path(os.environ.get("TRUSTVAULT_STORAGE", ROOT / "storage"))
+# Vercel Functions have a read-only filesystem except /tmp.
+# /tmp is ephemeral, so use external persistent storage for real production.
+IS_VERCEL = bool(os.environ.get("VERCEL"))
+DEFAULT_DB = Path("/tmp/trustvault.db") if IS_VERCEL else ROOT / "trustvault.db"
+DEFAULT_STORAGE = Path("/tmp/trustvault-storage") if IS_VERCEL else ROOT / "storage"
+DB_PATH = Path(os.environ.get("TRUSTVAULT_DB", DEFAULT_DB))
+STORAGE = Path(os.environ.get("TRUSTVAULT_STORAGE", DEFAULT_STORAGE))
 STORAGE.mkdir(parents=True, exist_ok=True)
 try:
     STORAGE.chmod(0o700)
@@ -264,6 +269,9 @@ def verify_audit_chain():
         previous = row["event_hash"]
     return True
 
+
+# Initialize the schema when the Flask app is imported by Vercel.
+init_db()
 
 @app.route("/")
 def home():
