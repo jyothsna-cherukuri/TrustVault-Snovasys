@@ -100,15 +100,24 @@ def connect_db():
 
 
 def init_db():
+    """Create the local/demo database and make the demo login reliable on Vercel.
+
+    Vercel uses /tmp for this hackathon deployment, so the database is ephemeral.
+    For a real production deployment, use a persistent external database.
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = connect_db()
-    con.executescript(SCHEMA)
-    user_count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    if user_count == 0:
-        # Convenient seeded accounts are enabled only in local development. Production
-        # must bootstrap one administrator from environment variables and then create
-        # ordinary accounts through the admin UI.
-        if not IS_PRODUCTION and os.environ.get("TRUSTVAULT_DEMO_MODE", "1") == "1":
+    try:
+        con.executescript(SCHEMA)
+
+        # On Vercel this project is a demo/hackathon deployment. Always ensure the
+        # documented demo accounts exist, even after a fresh/ephemeral instance.
+        # Locally, demo accounts remain controlled by TRUSTVAULT_DEMO_MODE.
+        use_demo_accounts = IS_VERCEL or (
+            not IS_PRODUCTION and os.environ.get("TRUSTVAULT_DEMO_MODE", "1") == "1"
+        )
+
+        if use_demo_accounts:
             seed = [
                 ("admin", "AdminDemo!2026", "admin"),
                 ("owner", "OwnerDemo!2026", "owner"),
@@ -116,21 +125,34 @@ def init_db():
                 ("otherowner", "OtherOwner!2026", "owner"),
             ]
             for username, password, role in seed:
-                con.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
-                            (username, generate_password_hash(password), role))
-        else:
-            username = os.environ.get("TRUSTVAULT_BOOTSTRAP_ADMIN_USERNAME", "").strip()
-            password = os.environ.get("TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD", "")
-            if not USERNAME_RE.fullmatch(username) or len(password) < 16:
-                con.close()
-                raise RuntimeError(
-                    "No users exist. Set TRUSTVAULT_BOOTSTRAP_ADMIN_USERNAME (3-40 safe characters) "
-                    "and TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD (at least 16 characters) for first startup."
+                con.execute(
+                    """INSERT INTO users(username,password_hash,role)
+                       VALUES(?,?,?)
+                       ON CONFLICT(username) DO UPDATE SET
+                           password_hash=excluded.password_hash,
+                           role=excluded.role,
+                           active=1""",
+                    (username, generate_password_hash(password), role),
                 )
-            con.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?, 'admin')",
-                        (username, generate_password_hash(password),))
-    con.commit()
-    con.close()
+        else:
+            user_count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            if user_count == 0:
+                username = os.environ.get("TRUSTVAULT_BOOTSTRAP_ADMIN_USERNAME", "").strip()
+                password = os.environ.get("TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD", "")
+                if not USERNAME_RE.fullmatch(username) or len(password) < 16:
+                    raise RuntimeError(
+                        "No users exist. Set TRUSTVAULT_BOOTSTRAP_ADMIN_USERNAME "
+                        "(3-40 safe characters) and TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD "
+                        "(at least 16 characters) for first startup."
+                    )
+                con.execute(
+                    "INSERT INTO users(username,password_hash,role) VALUES(?,?, 'admin')",
+                    (username, generate_password_hash(password)),
+                )
+
+        con.commit()
+    finally:
+        con.close()
 
 
 def audit(actor, action, document_id=None, target_user=None, details=None):
@@ -582,7 +604,13 @@ def admin_deactivate_user(user_id):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    try:
+        con = connect_db()
+        con.execute("SELECT 1").fetchone()
+        con.close()
+        return jsonify({"status": "ok", "database": "ok"})
+    except Exception:
+        return jsonify({"status": "error", "database": "unavailable"}), 500
 
 
 @app.errorhandler(400)
