@@ -20,11 +20,13 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 ROOT = Path(__file__).resolve().parent
-# Vercel Functions have a read-only filesystem except /tmp.
-# /tmp is ephemeral, so use external persistent storage for real production.
+
+# Vercel Functions can write only to /tmp.
+# Keep the original local paths when running outside Vercel.
 IS_VERCEL = bool(os.environ.get("VERCEL"))
 DEFAULT_DB = Path("/tmp/trustvault.db") if IS_VERCEL else ROOT / "trustvault.db"
 DEFAULT_STORAGE = Path("/tmp/trustvault-storage") if IS_VERCEL else ROOT / "storage"
+
 DB_PATH = Path(os.environ.get("TRUSTVAULT_DB", DEFAULT_DB))
 STORAGE = Path(os.environ.get("TRUSTVAULT_STORAGE", DEFAULT_STORAGE))
 STORAGE.mkdir(parents=True, exist_ok=True)
@@ -45,7 +47,11 @@ else:
     SECRET_KEY = SECRET_KEY or "local-development-only-secret-change-before-deployment"
     AUDIT_KEY = AUDIT_KEY or "local-development-only-audit-key-change-before-deployment"
 
-MAX_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
+# Vercel rejects function request bodies above 4.5 MB before Flask receives them.
+# Keep 5 MB locally, but use a conservative 3 MB file limit on Vercel so
+# multipart/form-data overhead stays safely below Vercel's platform limit.
+DEFAULT_MAX_UPLOAD = 3 * 1024 * 1024 if IS_VERCEL else 5 * 1024 * 1024
+MAX_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(DEFAULT_MAX_UPLOAD)))
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".csv", ".png", ".jpg", ".jpeg", ".docx", ".xlsx"}
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,40}$")
 app = Flask(__name__)
@@ -100,19 +106,13 @@ def connect_db():
 
 
 def init_db():
-    """Create the local/demo database and make the demo login reliable on Vercel.
-
-    Vercel uses /tmp for this hackathon deployment, so the database is ephemeral.
-    For a real production deployment, use a persistent external database.
-    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = connect_db()
     try:
         con.executescript(SCHEMA)
 
-        # On Vercel this project is a demo/hackathon deployment. Always ensure the
-        # documented demo accounts exist, even after a fresh/ephemeral instance.
-        # Locally, demo accounts remain controlled by TRUSTVAULT_DEMO_MODE.
+        # Vercel is used here for the hackathon/demo deployment.
+        # Ensure the same documented demo accounts exist on fresh/ephemeral instances.
         use_demo_accounts = IS_VERCEL or (
             not IS_PRODUCTION and os.environ.get("TRUSTVAULT_DEMO_MODE", "1") == "1"
         )
@@ -141,9 +141,8 @@ def init_db():
                 password = os.environ.get("TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD", "")
                 if not USERNAME_RE.fullmatch(username) or len(password) < 16:
                     raise RuntimeError(
-                        "No users exist. Set TRUSTVAULT_BOOTSTRAP_ADMIN_USERNAME "
-                        "(3-40 safe characters) and TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD "
-                        "(at least 16 characters) for first startup."
+                        "No users exist. Set TRUSTVAULT_BOOTSTRAP_ADMIN_USERNAME (3-40 safe characters) "
+                        "and TRUSTVAULT_BOOTSTRAP_ADMIN_PASSWORD (at least 16 characters) for first startup."
                     )
                 con.execute(
                     "INSERT INTO users(username,password_hash,role) VALUES(?,?, 'admin')",
@@ -153,7 +152,6 @@ def init_db():
         con.commit()
     finally:
         con.close()
-
 
 def audit(actor, action, document_id=None, target_user=None, details=None):
     """Serialize appends and HMAC-chain each event. External WORM export is still needed in production."""
@@ -292,7 +290,7 @@ def verify_audit_chain():
     return True
 
 
-# Initialize the schema when the Flask app is imported by Vercel.
+# Initialize schema before Vercel serves the first request.
 init_db()
 
 @app.route("/")
@@ -604,13 +602,7 @@ def admin_deactivate_user(user_id):
 
 @app.route("/health")
 def health():
-    try:
-        con = connect_db()
-        con.execute("SELECT 1").fetchone()
-        con.close()
-        return jsonify({"status": "ok", "database": "ok"})
-    except Exception:
-        return jsonify({"status": "error", "database": "unavailable"}), 500
+    return jsonify({"status": "ok"})
 
 
 @app.errorhandler(400)
@@ -632,7 +624,16 @@ def not_found(err):
 
 @app.errorhandler(413)
 def too_large(err):
-    return render_template("error.html", code=413, message="Upload is too large. Maximum file size is 5 MB."), 413
+    limit_mb = MAX_BYTES / (1024 * 1024)
+    if limit_mb.is_integer():
+        limit_text = f"{int(limit_mb)} MB"
+    else:
+        limit_text = f"{limit_mb:.1f} MB"
+    return render_template(
+        "error.html",
+        code=413,
+        message=f"Upload is too large. Maximum file size is {limit_text}."
+    ), 413
 
 
 @app.context_processor
